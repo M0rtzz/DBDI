@@ -33,6 +33,7 @@ class ToxicVectorExtractor:
     def __init__(self, model_name: str, device: str = 'cuda'):
         self.device = device
         self.model_name = model_name
+        self.batch_size = 8
 
         print(f"Loading model: {model_name}")
         self.model, self.tokenizer = load_model(model_name, model_paths)
@@ -155,7 +156,7 @@ class ToxicVectorExtractor:
             checkpoint_path = os.path.join(checkpoint_dir, f'{self.model_name}_{concept_name}_embeddings.pt')
             if os.path.exists(checkpoint_path):
                 print(f"Loading {concept_name} embeddings from checkpoint...")
-                return torch.load(checkpoint_path)
+                return torch.load(checkpoint_path, weights_only=False)
 
         print(f"\nCollecting {concept_name} concept activations for {len(prompts)} prompts...")
 
@@ -646,11 +647,7 @@ class MultiModelMultiDatasetExtractor:
                     print(f"\n✗ Error in task {task_key}: {str(e)}")
                     import traceback
                     traceback.print_exc()
-
-                    if task_idx < total_tasks:
-                        response = input("\nContinue with next task? (y/n): ")
-                        if response.lower() != 'y':
-                            break
+                    continue
 
             extractor.cleanup()
             print(f"\nCompleted all datasets for model {model_name}")
@@ -663,9 +660,7 @@ class MultiModelMultiDatasetExtractor:
         print(f"{'='*60}")
 
         if len(completed_tasks) == total_tasks:
-            response = input("\nAll tasks completed. Remove checkpoints? (y/n): ")
-            if response.lower() == 'y':
-                self.cleanup_checkpoints()
+            print("All tasks completed. Checkpoints kept for reproducibility/resume safety.")
 
     def cleanup_checkpoints(self):
         """Cleans up all checkpoint files."""

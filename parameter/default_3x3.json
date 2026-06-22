@@ -1,0 +1,54 @@
+{
+    "default": [
+        {"alpha": 9, "beta": 15},
+        {"alpha": 5, "beta": 19}
+    ],
+    "advbench": [
+        {"alpha": 9, "beta": 15},
+        {"alpha": 5, "beta": 19}
+    ],
+    "harmbench": [
+        {"alpha": 9, "beta": 15},
+        {"alpha": 5, "beta": 19}
+    ],
+    "strongreject": [
+        {"alpha": 9, "beta": 15},
+        {"alpha": 5, "beta": 19}
+    ],
+    "advbench_advbench": [
+        {"alpha": 9, "beta": 15},
+        {"alpha": 5, "beta": 19}
+    ],
+    "advbench_harmbench": [
+        {"alpha": 9, "beta": 15},
+        {"alpha": 5, "beta": 19}
+    ],
+    "advbench_strongreject": [
+        {"alpha": 9, "beta": 15},
+        {"alpha": 5, "beta": 19}
+    ],
+    "harmbench_advbench": [
+        {"alpha": 9, "beta": 15},
+        {"alpha": 5, "beta": 19}
+    ],
+    "harmbench_harmbench": [
+        {"alpha": 9, "beta": 15},
+        {"alpha": 5, "beta": 19}
+    ],
+    "harmbench_strongreject": [
+        {"alpha": 9, "beta": 15},
+        {"alpha": 5, "beta": 19}
+    ],
+    "strongreject_advbench": [
+        {"alpha": 9, "beta": 15},
+        {"alpha": 5, "beta": 19}
+    ],
+    "strongreject_harmbench": [
+        {"alpha": 9, "beta": 15},
+        {"alpha": 5, "beta": 19}
+    ],
+    "strongreject_strongreject": [
+        {"alpha": 9, "beta": 15},
+        {"alpha": 5, "beta": 19}
+    ]
+}

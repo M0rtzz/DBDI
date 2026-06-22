@@ -4,12 +4,37 @@ Utility functions for JBShield.
 
 import gc
 import json
+from pathlib import Path
 import numpy as np
 import pandas as pd
 import torch
 from tqdm import tqdm
 from fastchat.model import get_conversation_template
 from transformers import AutoModelForCausalLM, AutoTokenizer
+
+
+VICUNA_7B_V15_CHAT_TEMPLATE = (
+    "{% if messages[0]['role'] == 'system' %}"
+    "{% set loop_messages = messages[1:] %}"
+    "{% set system_message = messages[0]['content'] %}"
+    "{% else %}"
+    "{% set loop_messages = messages %}"
+    "{% set system_message = 'A chat between a curious user and an artificial intelligence assistant.\n"
+    "The assistant gives helpful, detailed, and polite answers to the user\\'s questions.' %}"
+    "{% endif %}"
+    "{% for message in loop_messages %}"
+    "{% if (message['role'] == 'user') != (loop.index0 % 2 == 0) %}"
+    "{{ raise_exception('Conversation roles must alternate user/assistant/user/assistant/...') }}"
+    "{% endif %}"
+    "{% if loop.index0 == 0 %}{{ system_message }}{% endif %}"
+    "{% if message['role'] == 'user' %}"
+    "{{ ' USER: ' + message['content'].strip() }}"
+    "{% elif message['role'] == 'assistant' %}"
+    "{{ ' ASSISTANT: ' + message['content'].strip() + eos_token }}"
+    "{% endif %}"
+    "{% endfor %}"
+    "{% if add_generation_prompt %}{{ ' ASSISTANT:' }}{% endif %}"
+)
 
 
 def cosine_similarity(v1, v2):
@@ -81,8 +106,95 @@ def load_model(model_name, model_paths):
 
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+    ensure_known_chat_template(tokenizer, model_name, model_path)
 
     return model, tokenizer
+
+
+def _is_vicuna_7b_v15_reference(value):
+    normalized = str(value or "").rstrip("/").lower()
+    if not normalized:
+        return False
+    name = Path(normalized).name
+    return name in {"vicuna-7b", "vicuna-7b-v1.5"} or normalized == "lmsys/vicuna-7b-v1.5"
+
+
+def ensure_known_chat_template(tokenizer, *references):
+    """Install in-memory fallback chat templates for known tokenizers missing one."""
+    if getattr(tokenizer, "chat_template", None) is not None:
+        return False
+
+    candidates = [*references, getattr(tokenizer, "name_or_path", "")]
+    if any(_is_vicuna_7b_v15_reference(candidate) for candidate in candidates):
+        tokenizer.chat_template = VICUNA_7B_V15_CHAT_TEMPLATE
+        return True
+    return False
+
+
+def chat_template_generation_kwargs(tokenizer):
+    template = getattr(tokenizer, "chat_template", None)
+    if template is not None and "enable_thinking" in str(template):
+        return {"enable_thinking": False}
+    return {}
+
+
+def format_chat_prompt(model_name, tokenizer, prompt):
+    """Format a single-turn user prompt for local chat models."""
+    prompt = prompt.strip()
+    ensure_known_chat_template(tokenizer, model_name)
+    if getattr(tokenizer, "chat_template", None):
+        return tokenizer.apply_chat_template(
+            [{"role": "user", "content": prompt}],
+            tokenize=False,
+            add_generation_prompt=True,
+            **chat_template_generation_kwargs(tokenizer),
+        )
+
+    model_lower = model_name.lower()
+    if "llama-2" in model_lower:
+        return f"[INST] {prompt} [/INST] "
+    if "llama-3.2-3b" in model_lower or "llama-3" in model_lower:
+        return f"<|start_header_id|>user<|end_header_id|>\n{prompt}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n"
+    if "qwen" in model_lower or "internlm" in model_lower:
+        return f"<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
+    if "mistral" in model_lower:
+        return f"[INST] {prompt} [/INST]"
+    if "deepseek" in model_lower:
+        return f"User: {prompt}\nAssistant:"
+
+    try:
+        conv = get_conversation_template(model_name)
+        conv.append_message(conv.roles[0], prompt)
+        conv.append_message(conv.roles[1], None)
+        return conv.get_prompt()
+    except Exception:
+        return f"## Query: {prompt}\n## Answer:"
+
+
+def get_transformer_layers(model):
+    """Return the decoder layer ModuleList/List for common causal LM wrappers."""
+    candidate_paths = (
+        ("model", "layers"),
+        ("base_model", "model", "layers"),
+        ("model", "model", "layers"),
+        ("transformer", "h"),
+        ("gpt_neox", "layers"),
+        ("layers",),
+    )
+
+    for path in candidate_paths:
+        module = model
+        for attr in path:
+            module = getattr(module, attr, None)
+            if module is None:
+                break
+        if module is not None and hasattr(module, "__len__") and len(module) > 0:
+            return module
+
+    raise AttributeError(
+        f"Could not locate transformer layers for {type(model).__name__}. "
+        "Expected one of model.layers, model.model.layers, transformer.h, or gpt_neox.layers."
+    )
 
 
 def get_judge_scores(target_model_name, judge_model, judge_tokenizer, question, answer):
@@ -213,11 +325,8 @@ def get_input_ids(model, model_name, tokenizer, prompt):
     Returns:
     - input_ids: The input_ids used for the prompt.
     """
-    # Fastchat cannot corectly load the chat template for Gemma models
-    conv = get_conversation_template(model_name)
-    conv.append_message(conv.roles[0], prompt)
-    conv.append_message(conv.roles[1], None)
-    input_ids = tokenizer([conv.get_prompt()], return_tensors="pt").to(model.device)
+    formatted_prompt = format_chat_prompt(model_name, tokenizer, prompt)
+    input_ids = tokenizer([formatted_prompt], return_tensors="pt").to(model.device)
     return input_ids
 
 

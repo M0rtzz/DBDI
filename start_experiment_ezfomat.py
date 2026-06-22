@@ -14,16 +14,21 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 from collections import defaultdict
 
-# Import StrongREJECT evaluator
-from strong_reject.evaluate import evaluate_dataset
-from datasets import Dataset
+try:
+    from strong_reject.evaluate import evaluate_dataset
+    from datasets import Dataset
+    STRONGREJECT_AVAILABLE = True
+except ImportError:
+    evaluate_dataset = None
+    Dataset = None
+    STRONGREJECT_AVAILABLE = False
 
 # Import DBDI tools
 import sys
 sys.path.append('.')
 
 from config import model_paths
-from utils import load_model
+from utils import ensure_known_chat_template, format_chat_prompt, get_transformer_layers, load_model
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 # Configure logging
@@ -32,7 +37,7 @@ logging.getLogger("transformers").setLevel(logging.WARNING)
 logging.getLogger("datasets").setLevel(logging.WARNING)
 
 # Local LLM Judge Configuration
-LOCAL_JUDGE_PATH = "./models2/Llama-Guard-3-8B"
+LOCAL_JUDGE_PATH = "./models/Meta-Llama-Guard-3-8B"
 
 # StrongREJECT Evaluator Configuration
 STRONGREJECT_EVALUATOR = "strongreject_finetuned"
@@ -64,6 +69,7 @@ class CombinedJailbreakAttack:
         self.refusal_vectors = {}
         self.toxic_vectors = {}
         self.cfg = self.model.config
+        self.transformer_layers = get_transformer_layers(self.model)
 
     def load_model_with_flash_attention(self, model_name: str, model_paths_dict: Dict):
         """Attempts to load the model using Flash Attention 2"""
@@ -79,15 +85,18 @@ class CombinedJailbreakAttack:
             trust_remote_code=True
         )
 
-        tokenizer = AutoTokenizer.from_pretrained(model_path)
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_path, trust_remote_code=True, use_fast=False
+        )
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
+        ensure_known_chat_template(tokenizer, model_name, model_path)
 
         return model, tokenizer
 
     def format_prompt(self, prompt_text: str) -> str:
-        """Formats the prompt using a simple template"""
-        return f"## Query: {prompt_text.strip()}\n## Answer:"
+        """Formats the prompt using the model tokenizer template when available."""
+        return format_chat_prompt(self.model_name, self.tokenizer, prompt_text)
 
     def load_attack_vectors(self, refusal_path: str, toxic_dataset: str):
         """Loads the extracted refusal and toxicity vectors"""
@@ -103,7 +112,7 @@ class CombinedJailbreakAttack:
             raise FileNotFoundError(f"Refusal vectors not found at {refusal_file}")
 
         logging.info(f"Loading refusal vectors from: {refusal_file}")
-        refusal_data_full = torch.load(refusal_file, map_location=self.device)
+        refusal_data_full = torch.load(refusal_file, map_location=self.device, weights_only=False)
         
         refusal_data = refusal_data_full.get('refusal_vectors', refusal_data_full)
         
@@ -125,11 +134,11 @@ class CombinedJailbreakAttack:
         toxic_data = None
         if os.path.exists(all_layers_file):
             logging.info(f"Loading toxic vectors from: {all_layers_file}")
-            toxic_data_full = torch.load(all_layers_file, map_location=self.device)
+            toxic_data_full = torch.load(all_layers_file, map_location=self.device, weights_only=False)
             toxic_data = toxic_data_full.get('harmful_vectors', toxic_data_full)
         elif os.path.exists(best_layers_file):
             logging.warning(f"all_layer_vectors.pt not found, falling back to: {best_layers_file}")
-            toxic_data_full = torch.load(best_layers_file, map_location=self.device)
+            toxic_data_full = torch.load(best_layers_file, map_location=self.device, weights_only=False)
             toxic_data = toxic_data_full.get('harmful_vectors', toxic_data_full)
         else:
             raise FileNotFoundError(f"No toxic vectors found in {toxic_path}")
@@ -199,7 +208,13 @@ class CombinedJailbreakAttack:
         valid_layers = []
         for layer_idx in target_layers:
             if layer_idx in self.refusal_vectors and layer_idx in self.toxic_vectors:
-                layer = self.model.model.layers[layer_idx]
+                if layer_idx >= len(self.transformer_layers):
+                    logging.warning(
+                        f"Layer {layer_idx} out of range for {self.model_name}; "
+                        f"model has {len(self.transformer_layers)} layers."
+                    )
+                    continue
+                layer = self.transformer_layers[layer_idx]
                 handle = layer.register_forward_hook(self.combined_attack_hook(layer_idx, alpha, beta))
                 self.hook_handles.append(handle)
                 valid_layers.append(layer_idx)
@@ -211,7 +226,7 @@ class CombinedJailbreakAttack:
             handle.remove()
         self.hook_handles = []
 
-    def generate_responses_batch(self, prompts: List[str], max_new_tokens: int = 500, batch_size: int = 8) -> List[str]:
+    def generate_responses_batch(self, prompts: List[str], max_new_tokens: int = 500, batch_size: int = 1) -> List[str]:
         """Generates responses in batches (using greedy decoding)"""
         responses = []
         formatted_prompts = [self.format_prompt(prompt) for prompt in prompts]
@@ -220,7 +235,11 @@ class CombinedJailbreakAttack:
         for i in tqdm(range(0, len(formatted_prompts), batch_size), desc="Generating responses"):
             batch_prompts = formatted_prompts[i:i+batch_size]
             inputs = self.tokenizer(
-                batch_prompts, return_tensors="pt", padding=True, truncation=True, max_length=512
+                batch_prompts,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=512,
             ).to(self.device)
             
             with torch.no_grad():
@@ -266,9 +285,6 @@ class FullExperiment:
         self.param_configs = param_configs
         self.intervention_layer = intervention_layer
         self.experiment_dir = None
-        
-        if not initialize_local_judge():
-            logging.error("Failed to initialize local judge, evaluation for non-strongreject datasets will fail.")
 
     def load_test_prompts(self, dataset_name: str) -> List[str]:
         """Loads all test prompts from a local JSON file"""
@@ -343,13 +359,18 @@ class FullExperiment:
 
     def evaluate_all_responses(self, responses_data: List[Dict], test_dataset: str) -> Dict:
         """Selects evaluation method based on the dataset"""
-        if test_dataset == 'strongreject':
+        if test_dataset == 'strongreject' and STRONGREJECT_AVAILABLE:
             return self.evaluate_responses_strongreject(responses_data)
         else:
+            if test_dataset == 'strongreject':
+                logging.warning("StrongREJECT is unavailable; falling back to local judge.")
             return self.evaluate_responses_local_judge(responses_data)
 
     def evaluate_responses_local_judge(self, responses_data: List[Dict]) -> Dict:
         """Evaluates responses using the local LLM Judge"""
+        if not initialize_local_judge():
+            logging.error("Failed to initialize local judge; marking responses as Needs Review.")
+
         logging.info("\nEvaluating responses using the local LLM Judge...")
         
         all_tasks = []
@@ -463,7 +484,9 @@ class FullExperiment:
                         with open(response_file, 'w', encoding='utf-8') as f:
                             json.dump(responses_data, f, indent=2, ensure_ascii=False)
                         logging.info(f"Responses saved to: {response_file}")
-                        
+
+                        attacker.cleanup()
+                        attacker = None
                         eval_results = self.evaluate_all_responses(responses_data, test_dataset)
                         
                         eval_dir = os.path.join(self.experiment_dir, 'evaluations')
@@ -483,9 +506,12 @@ class FullExperiment:
                             'evaluator': eval_results.get('evaluator', 'unknown')
                         }
                         model_results['results'].append(result)
-                        attacker.cleanup()
+                        if attacker is not None:
+                            attacker.cleanup()
+                        cleanup_local_judge()
                     except Exception as e:
                         logging.error(f"Error processing {model_name} with {toxic_dataset} on {test_dataset}: {e}", exc_info=True)
+                        cleanup_local_judge()
                         continue
             
             all_results.append(model_results)
@@ -558,6 +584,18 @@ def initialize_local_judge():
         logging.error(f"Failed to initialize Local LLM Judge: {e}")
         return False
 
+def cleanup_local_judge():
+    """Releases the local judge so the next target model can fit on one GPU."""
+    global local_judge_model, local_judge_tokenizer
+    if local_judge_model is not None:
+        del local_judge_model
+        local_judge_model = None
+    if local_judge_tokenizer is not None:
+        del local_judge_tokenizer
+        local_judge_tokenizer = None
+    torch.cuda.empty_cache()
+    gc.collect()
+
 def evaluate_single_task(task):
     """Evaluates a single task"""
     prompt, response, config_name, idx = task
@@ -616,11 +654,9 @@ def main():
     parser.add_argument('--param_config_file', type=str, required=True, help='JSON file containing parameter configurations')
     args = parser.parse_args()
     
-    try:
-        from strong_reject.evaluate import evaluate_dataset
-        from datasets import Dataset
+    if STRONGREJECT_AVAILABLE:
         logging.info("StrongREJECT imported successfully, will be used for 'strongreject' dataset evaluation.")
-    except ImportError:
+    else:
         logging.warning("StrongREJECT package not installed. LLM Judge will be used for all datasets.")
         logging.warning("Please run: pip install git+https://github.com/dsbowen/strong_reject.git@main")
     

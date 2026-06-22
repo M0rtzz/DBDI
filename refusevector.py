@@ -180,7 +180,7 @@ class RefusalVectorExtractor:
             embeddings_checkpoint_path = os.path.join(checkpoint_dir, f'{self.model_name}_embeddings.pt')
             if os.path.exists(embeddings_checkpoint_path):
                 print(f"Loading embeddings checkpoint from {embeddings_checkpoint_path}")
-                embeddings_checkpoint = torch.load(embeddings_checkpoint_path)
+                embeddings_checkpoint = torch.load(embeddings_checkpoint_path, weights_only=False)
 
         if embeddings_checkpoint:
             harmful_embeddings = embeddings_checkpoint['harmful_embeddings']
@@ -435,10 +435,7 @@ class MultiModelExtractor:
 
                 if 'extractor' in locals():
                     extractor.cleanup()
-
-                response = input("\nContinue with next model? (y/n): ")
-                if response.lower() != 'y':
-                    break
+                continue
 
         elapsed_time = time.time() - start_time
         print(f"\n{'='*60}")
@@ -448,9 +445,7 @@ class MultiModelExtractor:
         print(f"{'='*60}")
 
         if len(completed_models) == len(self.models):
-            response = input("\nAll models completed. Remove checkpoints? (y/n): ")
-            if response.lower() == 'y':
-                self.cleanup_checkpoints()
+            print("All models completed. Checkpoints kept for reproducibility/resume safety.")
 
     def cleanup_checkpoints(self):
         """Cleans up all checkpoint files."""
